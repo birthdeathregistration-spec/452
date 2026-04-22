@@ -16,7 +16,7 @@ from playwright.sync_api import sync_playwright
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # 👇👇👇 ঠিক এখানে তোমার বট টোকেন বসাও 👇👇👇
-API_TOKEN = "এখানে_আপনার_বট_টোকেন_দিন"
+API_TOKEN = "7668580200:AAHkMbQYunvP_Ll48gVdZv61jQ1aLcU6U5Q"
 
 bot = telebot.TeleBot(API_TOKEN)
 
