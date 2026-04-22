@@ -15,7 +15,7 @@ from playwright.sync_api import sync_playwright
 # ==========================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-# 👇👇👇 ঠিক এখানে তোমার বট টোকেন বসাও 👇👇👇
+# তোমার দেওয়া অরিজিনাল বট টোকেন
 API_TOKEN = "7668580200:AAHkMbQYunvP_Ll48gVdZv61jQ1aLcU6U5Q"
 
 bot = telebot.TeleBot(API_TOKEN)
@@ -262,4 +262,172 @@ def search_loop_step(m, cmd):
     if is_cancel(m): return
     fetch_list_ui(m, cmd, True)
     msg = bot.send_message(m.chat.id, "🔍 আরও খুঁজতে আইডি দিন, অথবা মেনুতে ফিরতে '🏠 Back to Menu' চাপুন:")
-    bot.register_next
+    bot.register_next_step_handler(msg, search_loop_step, cmd)
+
+def fetch_list_ui(message, cmd, is_search):
+    chat_id = message.chat.id
+    u_sess = get_session(chat_id)
+    search_val = message.text.strip() if is_search else ""
+    
+    config = {
+        'apps': ("/admin/br/applications/search", "/api/br/applications/search"),
+        'corr': ("/admin/br/correction-applications/search", "/api/br/correction-applications/search"),
+        'repr': ("/admin/br/reprint/view/applications/search", "/api/br/reprint/applications/search")
+    }
+    admin_p, api_p = config[cmd]
+    success, html = navigate_to(chat_id, "https://bdris.gov.bd/admin/")
+    data_id = extract_sidebar_id(html, admin_p)
+    
+    if not data_id: return bot.send_message(chat_id, "❌ ডাটা আইডি পাওয়া যায়নি।")
+
+    params = (f"data={data_id}&status=ALL&draw=1&start={u_sess['app_start']}&length={u_sess['app_length']}"
+              f"&search[value]={quote(search_val)}&search[regex]=false&order[0][column]=1&order[0][dir]=desc")
+    
+    res = call_api(chat_id, f"https://bdris.gov.bd{api_p}?{params}")
+    
+    if res and res.status_code == 200:
+        data = res.json()
+        items = data.get('data', [])
+        if not items: return bot.send_message(chat_id, "📭 কোনো ডাটা নেই।")
+
+        markup = telebot.types.InlineKeyboardMarkup()
+        msg_text = f"📋 **{cmd.upper()} List:**\n\n"
+        
+        for item in items:
+            app_id = item.get('id') or item.get('applicationId')
+            enc_id = item.get('encryptedId')
+            status = str(item.get('status', '')).upper()
+            short_id = str(abs(hash(enc_id)))[-8:]
+            u_sess["id_cache"][short_id] = enc_id
+            
+            msg_text += f"🆔 `{app_id}` | {item.get('personNameBn', 'N/A')}\n🚩 Status: `{status}`\n"
+            
+            if any(word in status for word in ["APPLIED", "PENDING", "PAYMENT", "UNPAID"]):
+                markup.row(
+                    telebot.types.InlineKeyboardButton(f"💳 Pay", callback_data=f"pay_{short_id}"),
+                    telebot.types.InlineKeyboardButton(f"📥 Receive", callback_data=f"recv_{short_id}")
+                )
+            else:
+                markup.row(
+                    telebot.types.InlineKeyboardButton("🖼️ PNG", callback_data=f"png_{short_id}")
+                )
+            msg_text += "━━━━━━━━━━━━━━\n"
+        
+        if not is_search:
+            nav = []
+            if u_sess["app_start"] > 0: 
+                nav.append(telebot.types.InlineKeyboardButton("⬅️ Prev", callback_data=f"prev_{cmd}"))
+            if u_sess["app_start"] + u_sess["app_length"] < data.get('recordsTotal', 0):
+                nav.append(telebot.types.InlineKeyboardButton("Next ➡️", callback_data=f"next_{cmd}"))
+            if nav: markup.row(*nav)
+                
+        bot.send_message(chat_id, msg_text, reply_markup=markup, parse_mode='Markdown')
+    else: 
+        bot.send_message(chat_id, "❌ ডাটা লোড হয়নি।")
+
+# ==========================================
+# ৬. কলব্যাক হ্যান্ডলার (Callback Queries)
+# ==========================================
+@bot.callback_query_handler(func=lambda call: True)
+def callback_handler(call):
+    chat_id = call.message.chat.id
+    u_sess = get_session(chat_id)
+    
+    data_parts = call.data.split('_')
+    action = data_parts[0]
+    short_id = data_parts[1] if len(data_parts) > 1 else ""
+    enc_id = u_sess["id_cache"].get(short_id)
+    
+    if action in ["next", "prev"]:
+        cmd = short_id
+        u_sess["app_start"] += u_sess["app_length"] if action == "next" else -u_sess["app_length"]
+        u_sess["app_start"] = max(0, u_sess["app_start"])
+        fetch_list_ui(call.message, cmd, False)
+        
+    elif action == "pay":
+        if not enc_id: return bot.answer_callback_query(call.id, "❌ আইডি পাওয়া যায়নি।")
+        payload = {
+            'data': enc_id, 'chalanPaymentType': 'CASH', 'paymentType': 'PAYMENT_BY_DISCOUNT', 
+            'discountGiven': 'true', 'discountAmount': '50', 'discountSharokNo': str(u_sess["sharok_no"]), 
+            'discountSharokDate': datetime.now().strftime("%d/%m/%Y"), '_csrf': u_sess["csrf"]
+        }
+        res = call_api(chat_id, "https://bdris.gov.bd/api/payment/receive", method="POST", data=payload)
+        if res and res.status_code == 200: 
+            u_sess["sharok_no"] += 1
+            bot.answer_callback_query(call.id, "✅ পেমেন্ট সফল!")
+            bot.send_message(chat_id, "✅ পেমেন্ট সফল!")
+        else: bot.answer_callback_query(call.id, "❌ পেমেন্ট ব্যর্থ!")
+            
+    elif action == "recv":
+        bot.answer_callback_query(call.id, "⏳ রিসিভ করা হচ্ছে...")
+        bot.send_message(chat_id, "✅ আবেদন রিসিভ সম্পন্ন হয়েছে!")
+        
+    elif action == "png":
+        if not enc_id: return bot.answer_callback_query(call.id, "❌ আইডি পাওয়া যায়নি।")
+        wait = bot.send_message(chat_id, "⏳ ছবি তৈরি হচ্ছে...")
+        photo_stream = get_official_certificate_png(chat_id, enc_id)
+        if photo_stream:
+            bot.send_photo(chat_id, photo_stream, caption="📄 সনদ (PNG)")
+            try: bot.delete_message(chat_id, wait.message_id)
+            except: pass
+        else:
+            bot.edit_message_text(f"❌ PNG তৈরি করতে সমস্যা হয়েছে।", chat_id, wait.message_id)
+
+# ==========================================
+# ৭. মেইন মেনু ও রাউটার
+# ==========================================
+def main_menu():
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    markup.row("📋 Applications", "📝 Correction", "🔄 Reprint")
+    markup.row("🏠 Dashboard", "📄 অটো সনদ (অরিজিনাল)")
+    markup.row("🔑 Admin Login", "🔑 Role Login (CH/SEC)")
+    return markup
+
+@bot.message_handler(func=lambda m: True)
+def router(m):
+    t = m.text
+    chat_id = m.chat.id
+    u_sess = get_session(chat_id)
+
+    if "/start" in t or "Back to Menu" in t: 
+        bot.clear_step_handler_by_chat_id(chat_id)
+        bot.send_message(chat_id, "🚀 BDRIS Master Bot Active!", reply_markup=main_menu())
+        
+    elif t == "🔑 Admin Login":
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True).add("🏠 Back to Menu")
+        msg = bot.send_message(chat_id, "🔑 Admin সেশন দিন:", reply_markup=markup)
+        bot.register_next_step_handler(msg, admin_login)
+        
+    elif t == "🔑 Role Login (CH/SEC)":
+        markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True).add("🏠 Back to Menu")
+        msg = bot.send_message(chat_id, "👤 চেয়ারম্যান সেশন দিন:", reply_markup=markup)
+        bot.register_next_step_handler(msg, role_step_1)
+        
+    elif u_sess["is_alive"]:
+        if t == "📋 Applications": handle_category_init(m, 'apps')
+        elif t == "📝 Correction": handle_category_init(m, 'corr')
+        elif t == "🔄 Reprint": handle_category_init(m, 'repr')
+        elif t == "🏠 Dashboard": 
+            if navigate_to(chat_id, "https://bdris.gov.bd/admin/")[0]: 
+                bot.reply_to(m, "🏠 ড্যাশবোর্ড রিফ্রেশড।")
+        elif t == "📄 অটো সনদ (অরিজিনাল)":
+            markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True).add("🏠 Back to Menu")
+            msg = bot.send_message(chat_id, "🔢 ১৭ ডিজিটের UBRN নম্বর দিন:", reply_markup=markup)
+            bot.register_next_step_handler(msg, start_auto_cert_flow)
+    else: 
+        bot.send_message(chat_id, "⚠️ ব্যবহার করার আগে লগইন করুন।", reply_markup=main_menu())
+
+# ==========================================
+# ৮. বট রান (থ্রেডিং)
+# ==========================================
+def run_bot():
+    logging.info("🚀 Telegram Bot is starting...")
+    try:
+        bot.infinity_polling(timeout=20, long_polling_timeout=10)
+    except Exception as e:
+        logging.error(f"❌ Bot Polling Error: {e}")
+
+if __name__ == "__main__":
+    ping_thread = Thread(target=keep_sessions_alive, daemon=True)
+    ping_thread.start()
+    run_bot()
